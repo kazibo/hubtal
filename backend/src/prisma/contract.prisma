@@ -1,0 +1,160 @@
+// use prisma-8
+
+// Data model
+//
+// Design rule: columns for anything we filter, sort, join or enforce rules on;
+// one JSON column (`KycCase.data`) for the form answers, whose shape is described by
+// a versioned form definition (see backend/src/forms). A handful of answers are
+// copied into indexed columns on every save (applicantName, passportNumber, ...)
+// so reviewers can search without digging into JSON.
+//
+// Adding a country or a new process variant needs NO migration: it is a new
+// form definition keyed by (country, flow, version).
+
+enum UserRole {
+  APPLICANT
+  REVIEWER
+}
+
+enum CaseFlow {
+  EOR
+  NON_EOR
+}
+
+enum CaseStatus {
+  DRAFT
+  SUBMITTED
+  IN_REVIEW
+  INFO_REQUESTED
+  APPROVED
+  REJECTED
+}
+
+enum CommentKind {
+  INTERNAL_NOTE // visible to reviewers only
+  INFO_REQUEST // visible to the applicant, optionally pointing at specific fields
+}
+
+model User {
+  id        String   @id @default(cuid(2))
+  email     String   @unique
+  name      String
+  role      UserRole
+  createdAt DateTime @default(now())
+
+  ownedCases    KycCase[]      @relation("CaseOwner")
+  assignedCases KycCase[]      @relation("CaseAssignee")
+  comments      CaseComment[]
+  statusChanges StatusChange[]
+  documents     CaseDocument[]
+}
+
+model KycCase {
+  id         String @id @default(cuid(2))
+  caseNumber Int    @unique @default(autoincrement()) // human-friendly: KYC-00042
+
+  // Which form this case is filled against. formVersion is pinned at creation so
+  // old cases keep rendering/validating against the definition they were created with.
+  country     String // ISO 3166-1 alpha-2, e.g. "ID"
+  flow        CaseFlow
+  formVersion Int
+
+  status CaseStatus @default(DRAFT)
+
+  // All answers, keyed by field key from the form definition.
+  data Json //@default("{}")
+
+  // Search/sort copies of answers, filled from `data` via `index` markers in the definition.
+  applicantName  String?
+  nationality    String?
+  passportNumber String?
+  email          String?
+  companyName    String?
+
+  ownerId    String
+  owner      User    @relation("CaseOwner", fields: [ownerId], references: [id])
+  assigneeId String?
+  assignee   User?   @relation("CaseAssignee", fields: [assigneeId], references: [id])
+
+  submittedAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   temporal.updatedAt()
+
+  comments     CaseComment[]
+  history      StatusChange[]
+  documents    CaseDocument[]
+  declarations DeclarationAcceptance[]
+
+  @@index([status])
+  @@index([country, flow])
+  @@index([ownerId])
+  @@index([passportNumber])
+  @@index([applicantName])
+  @@index([companyName])
+}
+
+model CaseComment {
+  id         String      @id @default(cuid(2))
+  caseId     String
+  kycCase    KycCase     @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  authorId   String
+  author     User        @relation(fields: [authorId], references: [id])
+  kind       CommentKind
+  body       String
+  // For INFO_REQUEST: top-level field keys the reviewer wants the applicant to revisit.
+  fieldKeys  String[]
+  // For INFO_REQUEST: set when the applicant resubmits.
+  resolvedAt DateTime?
+  createdAt  DateTime    @default(now())
+
+  @@index([caseId, createdAt])
+}
+
+// Append-only audit trail of status changes.
+model StatusChange {
+  id          String      @id @default(cuid(2))
+  caseId      String
+  kycCase     KycCase     @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  fromStatus  CaseStatus?
+  toStatus    CaseStatus
+  changedById String
+  changedBy   User        @relation(fields: [changedById], references: [id])
+  reason      String?
+  createdAt   DateTime    @default(now())
+
+  @@index([caseId, createdAt])
+}
+
+model CaseDocument {
+  id             String   @id @default(cuid(2))
+  caseId         String
+  kycCase        KycCase  @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  // Matches a `documents[].key` in the form definition.
+  requirementKey String
+  fileName       String
+  mimeType       String
+  sizeBytes      Int
+  // File name on disk / object key in storage. Never exposed to clients.
+  storageKey     String   @unique
+  uploadedById   String
+  uploadedBy     User     @relation(fields: [uploadedById], references: [id])
+  createdAt      DateTime @default(now())
+
+  @@index([caseId, requirementKey])
+}
+
+// What exactly the signatory agreed to, and when. Text is snapshotted so later
+// edits to a definition never rewrite history.
+model DeclarationAcceptance {
+  id             String   @id @default(cuid(2))
+  caseId         String
+  kycCase        KycCase  @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  declarationKey String
+  textSnapshot   String
+  formVersion    Int
+  signatoryName  String
+  ipAddress      String?
+  acceptedAt     DateTime @default(now())
+
+  @@unique([caseId, declarationKey])
+}
